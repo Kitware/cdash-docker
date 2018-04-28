@@ -1,6 +1,7 @@
 version: '3.3'
 services:
   cdash:
+    image: "kitware/cdash-docker"
     build: .
     depends_on:
       - mysql
