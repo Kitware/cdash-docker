@@ -1,0 +1,41 @@
+version: '3.3'
+services:
+  cdash:
+    build: .
+    depends_on:
+      - mysql
+    links:
+      - mysql
+    ports:
+     - "8080:80"
+    environment:
+      CDASH_DB_HOST: mysql
+      CDASH_DB_NAME: cdash
+      CDASH_DB_TYPE: mysql
+      CDASH_DB_LOGIN: root
+      CDASH_DB_PORT: ''
+      CDASH_DB_PASS: ''
+      CDASH_DB_CONNECTION_TYPE: host
+      CDASH_ROOT_ADMIN_PASS: secret
+
+      CDASH_USER_LIST: 'admin,user'
+
+      CDASH_USER_admin_EMAIL: admin@docker.container
+      CDASH_USER_admin_DISPOSITION: admin
+      CDASH_USER_admin_FIRST_NAME: Admin
+      CDASH_USER_admin_LAST_NAME: User
+      CDASH_USER_admin_PASSWORD: adminsecret
+
+      CDASH_USER_user_EMAIL: user@docker.container
+      CDASH_USER_user_DISPOSITION: user
+      CDASH_USER_user_FIRST_NAME: Test
+      CDASH_USER_user_LAST_NAME: User
+      CDASH_USER_user_PASSWORD: usersecret
+
+  mysql:
+    image: "mysql/mysql-server:5.5"
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_ROOT_PASSWORD: ''
+      MYSQL_DATABASE: 'cdash'
+      MYSQL_ROOT_HOST: '%'
