@@ -38,7 +38,6 @@ RUN mkdir -p /var/www                                             \
  && ln -s /var/www/cdash/public /var/www/html
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
-COPY docker-lib.sh /docker-lib.sh
 RUN chmod +x /docker-entrypoint.sh
 
 WORKDIR /var/www/cdash
