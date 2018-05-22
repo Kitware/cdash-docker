@@ -1,13 +1,139 @@
 #!/bin/bash
 
+declare -a __exit_callbacks
+onexit() {
+    __exit_callbacks[${#__exit_callbacks[@]}]="$@"
+}
+
+do_exit() {
+    if [ -z "$exit_code" ] ; then
+        exit_code="$1"
+        local n
+        n=${#__exit_callbacks[@]}
+        for ((; n--; )) ; do
+            eval "${__exit_callbacks[$n]}"
+        done
+    fi
+}
+
+EXEC() {
+    do_exit 0
+    exec "$@"
+}
+
+trap "do_exit 1; exit $exit_code" INT TERM QUIT
+trap "do_exit 0; exit $exit_code" EXIT
+
+onexit 'if [ -n "$tmpdir" -a -d "$tmpdir" ] ; then rm -r "$tmpdir" ; fi'
+
+ensure_tmp() {
+    if [ -z "$tmpdir" ] ; then
+        tmpdir="$( mktemp -d )"
+    fi
+}
+
+# poor man's CDash client
+mksession() {
+    local result
+    ensure_tmp
+    mkdir -p "$tmpdir/sessions"
+    until mkdir "$result" 2> /dev/null ; do
+        result="$tmpdir/sessions/$RANDOM"
+    done
+    echo "$result"
+}
+
+ajax() {
+    local method
+    local session
+    local route
+    local curl_args
+    local arg
+
+    method="$1" ; shift
+    session="$1" ; shift
+    route="$1" ; shift
+
+    if [ "$method" '=' 'POST' ] ; then
+        for arg in "$@" ; do
+            curl_args="$curl_args --form '$arg'"
+        done
+    fi
+
+    local oldcookies
+    local newcookies
+
+    oldcookies="$session/cookies.txt"
+    newcookies="$session/cookies.tmp"
+
+    if [ "$session" '!=' '-' ] ; then
+        if [ -f "$oldcookies" ] ; then
+            curl_args="$curl_args --cookie '$oldcookies'"
+        fi
+        curl_args="$curl_args --cookie-jar '$newcookies'"
+    fi
+
+    local port="$PORT"
+    if [ -n "$port" ] ; then
+        port=":$port"
+    fi
+
+    curl_args="$curl_args 'http://localhost${port}/$route"
+
+    if [ "$method" '=' 'GET' ] ; then
+        arg="$1" ; shift
+        if [ -n "$arg" ] ; then
+            curl_args="${curl_args}?$arg"
+        fi
+
+        for arg in "$@" ; do
+            curl_args="${curl_args}&$arg"
+        done
+    fi
+
+    curl_args="${curl_args}'"
+
+    eval "curl $curl_args" 2>&-
+
+    if [ "$session" '!=' '-' ] ; then
+        if [ -f "$newcookies" ] ; then
+            mv "$newcookies" "$oldcookies"
+        fi
+    fi
+
+    sleep 0.2
+}
+
+get() {
+    ajax GET "$@"
+}
+
+post() {
+    ajax POST "$@"
+}
+
+user_prefix="__user"
+user_set() {
+    email="$1" ; shift
+    key="$1" ; shift
+    value="$1" ; shift
+    email_hash="$( echo "$email" | sha1sum | cut -d\  -f 1 )"
+    eval "${user_prefix}_${email_hash}_${key}=\"${value}\""
+}
+
+user_get() {
+    email="$1" ; shift
+    key="$1" ; shift
+    email_hash="$( echo "$email" | sha1sum | cut -d\  -f 1 )"
+    eval "echo \"\$${user_prefix}_${email_hash}_${key}\""
+}
+
 DEBUG() {
     if [ -n "$DEBUG" ] ; then
         echo -n "DEBUG:: "
         echo "$@"
     fi
 }
-
-source "/docker-lib.sh"
 
 if [ -z "$CDASH_ROOT_ADMIN_PASS" ] ; then
     cat << ____EOF
@@ -17,68 +143,17 @@ ____EOF
     exit 1
 fi 1>&2
 
-config_variables="CDASH_DB_HOST:STRING"
-config_variables="${config_variables} CDASH_DB_LOGIN:STRING"
-config_variables="${config_variables} CDASH_DB_PORT:STRING"
-config_variables="${config_variables} CDASH_DB_PASS:STRING"
-config_variables="${config_variables} CDASH_DB_NAME:STRING"
-config_variables="${config_variables} CDASH_DB_TYPE:STRING"
-config_variables="${config_variables} CDASH_DB_CONNECTION_TYPE:STRING"
-config_variables="${config_variables} CDASH_EMAILADMIN:STRING"
-config_variables="${config_variables} CDASH_EMAIL_FROM:STRING"
-config_variables="${config_variables} CDASH_EMAIL_REPLY:STRING"
-config_variables="${config_variables} CDASH_EMAIL_SMTP_HOST:STRING"
-config_variables="${config_variables} CDASH_EMAIL_SMTP_PORT:INT"
-config_variables="${config_variables} CDASH_EMAIL_SMTP_ENCRYPTION:STRING"
-config_variables="${config_variables} CDASH_EMAIL_SMTP_LOGIN:STRING"
-config_variables="${config_variables} CDASH_EMAIL_SMTP_PASS:STRING"
-config_variables="${config_variables} CDASH_REGISTRATION_EMAIL_VERIFY:BOOL"
-config_variables="${config_variables} CDASH_USE_SENDGRID:BOOL"
-config_variables="${config_variables} CDASH_SENDGRID_API_KEY:STRING"
-config_variables="${config_variables} CDASH_COOKIE_EXPIRATION_TIME:STRING"
-config_variables="${config_variables} CDASH_MINIMUM_PASSWORD_LENGTH:INT"
-config_variables="${config_variables} CDASH_MINIMUM_PASSWORD_COMPLEXITY:INT"
-config_variables="${config_variables} CDASH_PASSWORD_COMPLEXITY_COUNT:INT"
-config_variables="${config_variables} CDASH_USE_HTTPS:STRING"
-config_variables="${config_variables} CDASH_SERVER_NAME:STRING"
-config_variables="${config_variables} CDASH_SERVER_PORT:STRING"
-
-tmp_config_file="/var/www/cdash/config/config.tmp.php"
-tmp_hash_file="/var/www/cdash/config/config.tmp.checksum"
 local_config_file="/var/www/cdash/config/config.local.php"
 
 (
     echo '<?php'
-    for token in $config_variables ; do
-        entry=(${token/:/ })
-        var_name=${entry[0]}
-        var_type=${entry[1]}
-
-        # skip the variable if the user did not set it
-        if eval "[ -z \${$var_name+x} ]" ; then
-            continue
-        fi
-
-        eval "var_value=\"\$$var_name\""
-
-        quote=""
-        if [ -z "$var_type" -o "$var_type" '=' 'STRING' ] ; then
-            quote="'"
-        fi
-
-        echo "\$$var_name = ${quote}${var_value}${quote};"
-    done
-) | tee "$tmp_config_file" | sha1sum > "$tmp_hash_file"
-
-( sha1sum --check --status "$tmp_hash_file" < "$local_config_file" ) 2>/dev/null
-if [ "$?" '!=' '0' ] ; then
-    mv "$tmp_config_file" "$local_config_file"
-fi
-rm "$tmp_hash_file"
+    if [ '!' -z ${CDASH_CONFIG+x} ] ; then
+        echo "$CDASH_CONFIG"
+    fi
+) > "$local_config_file"
 
 PORT="$(( (RANDOM % 20000) + 10000 ))"
 sed -i 's/^Listen [0-9][0-9]*/Listen '"$PORT"'/g' /etc/apache2/ports.conf
-head /etc/apache2/ports.conf
 sed -i 's/^<VirtualHost \*:[0-9][0-9]*>/<VirtualHost \*:'"$PORT"'>/g' \
     /etc/apache2/sites-enabled/000-default.conf
 echo "\$CDASH_FULL_EMAIL_WHEN_ADDING_USER = '1';" >> "$local_config_file"
@@ -137,145 +212,155 @@ fi
 
 if [ "$root_login_failed" '!=' '1' ] ; then
     declare -a users_list
-    users_file="/cdash_users"
-    if [ -f "$users_file" ] ; then
+    if [ '!' -z ${CDASH_STATIC_USERS+x} ] ; then
+        ensure_tmp
+        mkfifo "$tmpdir/fifo"
+        eval "exec 3<>$tmpdir/fifo"
+        unlink "$tmpdir/fifo"
+
+        echo "$CDASH_STATIC_USERS" >&3
+        echo EOF >&3
+
         oldifs="$IFS"
         IFS=$'\n'
-        exec 3<"$users_file"
+
         while read -u 3 line ; do
             processed_line="$( echo "$line" |
                      sed $'s/\t\t*/ /g' | sed 's/  */ /g' | sed 's/#.*//g')"
+
+            if [ "$processed_line" '=' 'EOF' ] ; then
+                break
+            fi
+
             if [ -z "$( echo "$processed_line" | sed $'s/[ \t]*//g' )" ] ; then
                 DEBUG "SKIPPING LINE"
                 DEBUG "[$line]"
                 continue
             fi
+
             eval "entry=($processed_line)"
+            _disp=
+            _email=
+            _pass=
+            _newpass=
 
-            disp="${entry[0]}"
-            if [ "$disp" '=' 'delete' ] ; then
-                email="${entry[1]}"
-                pass="${entry[2]}"
-                user_set "$email" disp "${disp}"
-                user_set "$email" pass "${pass}"
+            if [ "${entry[0]}" '=' 'USER'   -o \
+                 "${entry[0]}" '=' 'ADMIN'  -o \
+                 "${entry[0]}" '=' 'DELETE' ] ; then
+
+                # explicit user entry line
+                _disp="${entry[0]}"
+                _email="${entry[1]}"
+                _pass="${entry[2]}"
+                _newpass="${entry[3]}"
+                parsed_user=1
+
+            elif [ "${entry[0]}" '!=' "${entry[0]/@*}" ] ; then
+                # implicit user entry line
+                _disp=USER
+                _email="${entry[0]}"
+                _pass="${entry[1]}"
+                _newpass="${entry[2]}"
+                parsed_user=1
+
+            elif [ "${entry[0]}" '=' 'INFO' ] ; then
+                # explicit user info line
+                first="${entry[1]}"
+                last="${entry[2]}"
+                institution="${entry[3]}"
+                parsed_user=0
+
+            else
+                # implicit user info line
+                first="${entry[0]}"
+                last="${entry[1]}"
+                institution="${entry[2]}"
+                parsed_user=0
             fi
 
-            if [ "${#entry[@]}" '=' 6 ] ; then
-                disp="${entry[0]}"
-                email="${entry[1]}"
-                pass="${entry[2]}"
-                first="${entry[3]}"
-                last="${entry[4]}"
-                institution="${entry[5]}"
-            fi
+            if [ -n "$email" ] ; then
+                user_set "$email" disp "$disp"
+                user_set "$email" pass "$pass"
+                user_set "$email" newpass "$newpass"
 
-            if [ "${#entry[@]}" '=' 7 ] ; then
-                disp="${entry[0]}"
-                email="${entry[1]}"
-                pass="${entry[2]}"
-                newpass="${entry[3]}"
-                first="${entry[4]}"
-                last="${entry[5]}"
-                institution="${entry[6]}"
+                if [ "$parsed_user" '=' '0' ] ; then
+                    user_set "$email" first "$first"
+                    user_set "$email" last "$last"
+                    user_set "$email" institution "$institution"
+                fi
 
-                if [ "$( user_get "$email" disp )" '=' 'user' ] ; then
-                    user_set "$email" newpass "$newpass"
+                if [ "$( user_get "$email" listed )" '!=' 1 ] ; then
+                    users_list[${#users_list[@]}]="$email"
+                    user_set "$email" listed 1
                 fi
             fi
 
-            if [ "$disp" '!=' 'delete' ] ; then
-                user_set "$email" disp        "$disp"
-                user_set "$email" pass        "$pass"
-                user_set "$email" first       "$first"
-                user_set "$email" last        "$last"
-                user_set "$email" institution "$institution"
+            email="$_email"
+            disp="$_disp"
+            pass="$_pass"
+            newpass="$_newpass"
+
+            if [ -n "$DEBUG" ] ; then
+                if [ "$parsed_user" '=' '0' ] ; then
+                    DEBUG "PARSED USER INFO"
+                    DEBUG "  First Name:  |$first|"
+                    DEBUG "  Last Name:   |$last|"
+                    DEBUG "  Institution: |$institution|"
+                else
+                    DEBUG "PARSED USER ENTRY"
+                    DEBUG "  email:        |$email|"
+                    DEBUG "  disposition:  |$disp|"
+                    DEBUG "  password:     |$pass|"
+                    DEBUG "  new password: |$newpass|"
+                fi
             fi
+        done
+
+        if [ -n "$email" ] ; then
+            user_set "$email" disp "$disp"
+            user_set "$email" pass "$pass"
+            user_set "$email" newpass "$newpass"
 
             if [ "$( user_get "$email" listed )" '!=' 1 ] ; then
                 users_list[${#users_list[@]}]="$email"
                 user_set "$email" listed 1
             fi
+        fi
 
-            DEBUG "PARSED USER ENTRY FROM FILE"
-            DEBUG "  $email"
-            DEBUG "  disposition: $disp"
-            DEBUG "  password: $pass"
-            if [ "$disp" '!=' 'delete' ] ; then
-                DEBUG "  new pass: $newpass"
-                DEBUG "  First Name: $first"
-                DEBUG "  Last Name: $last"
-                DEBUG "  Institution: $institution"
-            fi
-        done
         exec 3<&-
         IFS="$oldifs"
     fi
 
-    eval "env_list=($(
-        echo "$CDASH_USER_LIST" | sed 's/,/" "/g' | sed 's/\(.*\)/"\1"/g' ))"
-
-    for (( i=0; i < ${#env_list[@]} ; ++i )) ; do
-        token="${env_list[$i]}"
-        if [ -z "$token" ] ; then
-            continue
-        fi
-
-        eval "email=\"\$CDASH_USER_${token}_EMAIL\""
-        if [ "$( user_get "$email" listed )" '!=' 1 ] ; then
-            users_list[${#users_list[@]}]="$email"
-            user_set "$email" listed 1
-        fi
-
-        for tuple in 'disp:DISPOSITION' 'pass:PASSWORD' 'first:FIRST_NAME' \
-                     'last:LAST_NAME' 'newpass:NEW_PASSWORD' \
-                     'institution:INSTITUTION' ; do
-            param="${tuple/:*}"
-            variable="${tuple/*:}"
-
-            eval "value=\"\$CDASH_USER_${token}_${variable}\""
-            if [ -n "$value" ] ; then
-                user_set "$email" "$param" "$value"
-            fi
-        done
-
-        DEBUG "PROCESSED USER ENTRY FROM ENVIRONMENT VARIABLE"
-        DEBUG "  $email"
-        DEBUG "  disposition: $disp"
-        DEBUG "  password: $pass"
-        DEBUG "  new pass: $newpass"
-        DEBUG "  First Name: $first"
-        DEBUG "  Last Name: $last"
-        DEBUG "  Institution: $institution"
-    done
-
     DEBUG "BEGIN DUMP OF USER TABLE"
-    for (( i=0; i < ${#users_list[@]} ; ++i )) ; do
-        email="${users_list[$i]}"
+    if [ -n "$DEBUG" ] ; then
+        for (( i=0; i < ${#users_list[@]} ; ++i )) ; do
+            email="${users_list[$i]}"
 
-        for tuple in "disp" "pass" "newpass" "first:John/Jane" \
-                     "last:Doe" "institution:none" ; do
-            fragment="${tuple/:*}"
-            tuple="${tuple:$(( ${#fragment} + 1 ))}"
-            param="$fragment"
-            fragment="${tuple/:*}"
-            tuple="${tuple:$(( ${#fragment} + 1 ))}"
-            default="$fragment"
+            for tuple in "disp" "pass" "newpass" "first:NONE" \
+                         "last:NONE" "institution:NONE" ; do
+                fragment="${tuple/:*}"
+                tuple="${tuple:$(( ${#fragment} + 1 ))}"
+                param="$fragment"
+                fragment="${tuple/:*}"
+                tuple="${tuple:$(( ${#fragment} + 1 ))}"
+                default="$fragment"
 
-            value="$( user_get "$email" "$param" )"
-            if [ -z "$value" -a -n "$default" ] ; then
-                value="$default"
-            fi
-            eval "${param}=\"$value\""
+                value="$( user_get "$email" "$param" )"
+                if [ -z "$value" -a -n "$default" ] ; then
+                    value="$default"
+                fi
+                eval "${param}=\"$value\""
+            done
+            DEBUG "$i:"
+            DEBUG "  $email"
+            DEBUG "  disposition: $disp"
+            DEBUG "  password: $pass"
+            DEBUG "  new pass: $newpass"
+            DEBUG "  First Name: $first"
+            DEBUG "  Last Name: $last"
+            DEBUG "  Institution: $institution"
         done
-        DEBUG "$i:"
-        DEBUG "  $email"
-        DEBUG "  disposition: $disp"
-        DEBUG "  password: $pass"
-        DEBUG "  new pass: $newpass"
-        DEBUG "  First Name: $first"
-        DEBUG "  Last Name: $last"
-        DEBUG "  Institution: $institution"
-    done
+    fi
 
     for (( i=0; i < ${#users_list[@]} ; ++i )) ; do
         email="${users_list[$i]}"
@@ -304,8 +389,8 @@ if [ "$root_login_failed" '!=' '1' ] ; then
             fi
         fi
 
-        for tuple in "disp" "pass" "newpass" "first:John/Jane" \
-                     "last:Doe" "institution:none" ; do
+        for tuple in "disp" "pass" "newpass" "first:NONE" \
+                     "last:NONE" "institution:NONE" ; do
             fragment="${tuple/:*}"
             tuple="${tuple:$(( ${#fragment} + 1 ))}"
             param="$fragment"
@@ -329,7 +414,7 @@ if [ "$root_login_failed" '!=' '1' ] ; then
 
         user_id="${ids[0]}"
 
-        if [ "$disp" '=' 'delete' ] ; then
+        if [ "$disp" '=' 'DELETE' ] ; then
             # REMOVE USER
             DEBUG "REMOVING USER: $email"
             if [ -n "$user_id" ] ; then
@@ -381,14 +466,14 @@ if [ "$root_login_failed" '!=' '1' ] ; then
             fi
          fi
 
-         if [ "$disp" '=' 'admin' ] ; then
+         if [ "$disp" '=' 'ADMIN' ] ; then
              DEBUG "PROMOTING USER: $email"
              post "$root_session" manageUsers.php        \
                                   userid="$user_id"      \
                                   makeadmin="make admin" &> /dev/null
          fi
 
-         if [ "$disp" '=' 'user' ] ; then
+         if [ "$disp" '=' 'USER' ] ; then
              DEBUG "DEMOTING USER: $email"
              post "$root_session" manageUsers.php                   \
                                   userid="$user_id"                 \
